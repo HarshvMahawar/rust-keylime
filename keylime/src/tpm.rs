@@ -2913,3 +2913,27 @@ pub mod tests {
         assert!(r.is_ok(), "Result: {r:?}");
     }
 }
+
+use serde::Serialize;
+
+#[derive(Serialize)]
+pub struct CMW {
+    #[serde(rename = "__cmwc_t")]
+    pub cmwc_type: String,
+    pub evidence: Evidence,
+}
+
+#[derive(Serialize)]
+pub struct Evidence {
+    pub tpms_attest: EvidenceEntry,
+    pub tpmt_signature: EvidenceEntry,
+    pub pcr_values: EvidenceEntry,
+    pub event_log: EvidenceEntry,
+    pub keylime_metadata: EvidenceEntry,
+}
+
+#[derive(Serialize)]
+pub struct EvidenceEntry(
+    pub String, // content_type, e.g. "application/vnd.keylime.tpm2.tpms_attest"
+    pub String, // base64-encoded data
+);

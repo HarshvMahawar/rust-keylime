@@ -2,12 +2,17 @@
 // Copyright 2021 Keylime Authors
 
 use crate::common::JsonWrapper;
+use std::collections::HashMap;
+use keylime::tpm::testing::decode_quote_string;
 use crate::crypto;
 use crate::serialization::serialize_maybe_base64;
 use crate::{tpm, Error as KeylimeError, QuoteData};
 use actix_web::{http, web, HttpRequest, HttpResponse, Responder};
 use base64::{engine::general_purpose, Engine as _};
 use keylime::quote::{Integ, KeylimeQuote};
+
+use keylime::tpm::{CMW, Evidence, EvidenceEntry};
+
 use log::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -108,6 +113,51 @@ async fn identity(
     HttpResponse::Ok().json(response)
 }
 
+pub fn extract_api_version(req: &HttpRequest) -> String {
+    // Get path like "/v3/quotes/integrity"
+    let path = req.path();
+
+    for segment in path.split('/') {
+        if segment.starts_with('v') {
+            return segment.to_string();
+        }
+    }
+
+    // default fallback to v2.2
+    "v2.2".to_string()
+}
+
+use tss_esapi::traits::Marshall;
+
+use base64::Engine;
+
+/// parse the quote string and returns TPMS_ATTEST, TPMT_SIGNATURE, PCRs as byte arrays
+pub fn parse_quote_fields(quote_str: &str) -> HashMap<&'static str, Vec<u8>> {
+    let mut result = HashMap::new();
+
+    let cleaned = quote_str.strip_prefix('r').unwrap_or(quote_str);
+
+    let parts: Vec<&str> = cleaned.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        return result;
+    }
+
+    _ = result.insert(
+        "TPMS_ATTEST",
+        general_purpose::STANDARD.decode(parts[0]).unwrap_or_default(),
+    );
+    _ = result.insert(
+        "TPMT_SIGNATURE",
+        general_purpose::STANDARD.decode(parts[1]).unwrap_or_default(),
+    );
+    _ = result.insert(
+        "PCRs",
+        general_purpose::STANDARD.decode(parts[2]).unwrap_or_default(),
+    );
+
+    result
+}
+
 // This is a Quote request from the cloud verifier, which will check
 // integrity measurement. The PCRs included in the Quote will be specified
 // by the mask. It should return this data:
@@ -118,6 +168,9 @@ async fn integrity(
     param: web::Query<Integ>,
     data: web::Data<QuoteData<'_>>,
 ) -> impl Responder {
+
+    let api_version = extract_api_version(&req);
+
     // nonce, mask can only be in alphanumerical format
     if !param.nonce.chars().all(char::is_alphanumeric) {
         warn!("Get quote returning 400 response. Parameters should be strictly alphanumeric: {}", param.nonce);
@@ -298,6 +351,29 @@ async fn integrity(
         } else {
             (None, None, None)
         };
+
+    if api_version == "v3" {
+        let parsed_quote = parse_quote_fields(&id_quote.quote);
+        let event_log = build_event_log(
+            ima_measurement_list.as_deref().unwrap_or(""),
+            mb_measurement_list.as_deref(),
+        );
+        let metadata = get_keylime_metadata(
+            pubkey.clone(),
+            Some("123".to_string()), // where to get boottime?
+            &id_quote.hash_alg,
+            &id_quote.sign_alg,
+        );
+        let cmw = build_cmw(
+            &parsed_quote["TPMS_ATTEST"],
+            &parsed_quote["TPMT_SIGNATURE"],
+            &parsed_quote["PCRs"],
+            &event_log,
+            &metadata,
+        );
+
+        return HttpResponse::Ok().json(cmw);
+    }
 
     // Generate the final quote based on the ID quote
     let quote = KeylimeQuote {
@@ -589,4 +665,119 @@ mod tests {
         assert_eq!(result.results, json!({}));
         assert_eq!(result.code, 405);
     }
+}
+
+// CMW functions
+
+fn build_cmw(
+    tpms_attest: &[u8],
+    tpmt_signature: &[u8],
+    pcr_values: &[u8],
+    event_log: &Value,
+    keylime_metadata: &Value,
+) -> CMW {
+    CMW {
+        cmwc_type: "tag:keylime.org,2025:tpm2-agent".to_string(),
+        evidence: Evidence {
+            tpms_attest: EvidenceEntry(
+                "application/vnd.keylime.tpm2.tpms_attest".to_string(),
+                general_purpose::URL_SAFE_NO_PAD.encode(tpms_attest),
+            ),
+            tpmt_signature: EvidenceEntry(
+                "application/vnd.keylime.tpm2.tpmt_signature".to_string(),
+                general_purpose::URL_SAFE_NO_PAD.encode(tpmt_signature),
+            ),
+            pcr_values: EvidenceEntry(
+                "application/vnd.keylime.tpm2.pcr_values".to_string(),
+                general_purpose::URL_SAFE_NO_PAD.encode(pcr_values),
+            ),
+            event_log: EvidenceEntry(
+                "application/vnd.keylime.cel".to_string(),
+                general_purpose::URL_SAFE_NO_PAD.encode(
+                    serde_json::to_string(event_log).unwrap().as_bytes(),
+                ),
+            ),
+            keylime_metadata: EvidenceEntry(
+                "application/vnd.keylime.tpm2.metadata".to_string(),
+                general_purpose::URL_SAFE_NO_PAD.encode(
+                    serde_json::to_string(keylime_metadata).unwrap().as_bytes(),
+                ),
+            ),
+        },
+    }
+}
+
+use serde_json::{json, Value};
+
+fn build_event_log(ima_list_str: &str, mb_list_b64: Option<&str>) -> Value {
+    let mut cel = Vec::new();
+    let mut recnum = 0;
+
+    // --- IMA measurement list (PCR 10) ---
+    for line in ima_list_str.lines() {
+        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        if parts.len() < 5 {
+            continue;
+        }
+
+        let pcr_index: u32 = parts[0].parse().unwrap_or(10); // fallback to PCR 10
+        let template_type = parts[2];
+        let template_hash = parts[3];
+        let path = parts[4];
+
+        if let Some((hash_alg, hash_val)) = template_hash.split_once(':') {
+            if let Ok(digest_bytes) = hex::decode(hash_val) {
+                let entry = json!({
+                    "recnum": recnum,
+                    "pcr": pcr_index,
+                    "digests": [{
+                        "hashAlg": hash_alg.to_lowercase(),
+                        "digest": general_purpose::URL_SAFE_NO_PAD.encode(&digest_bytes)
+                    }],
+                    "content_type": "ima_template",
+                    "content": {
+                        "template_name": template_type,
+                        "template_data": general_purpose::URL_SAFE_NO_PAD.encode(format!("{} {}", template_hash, path).as_bytes())
+                    }
+                });
+                cel.push(entry);
+                recnum += 1;
+            }
+        }
+    }
+
+    // --- Measured Boot Log (PCR 0) ---
+    if let Some(mb64) = mb_list_b64 {
+        if let Ok(decoded) = general_purpose::STANDARD.decode(mb64) {
+            let sha1_digest = general_purpose::URL_SAFE_NO_PAD.encode(&decoded[..20]);
+            let full_encoded = general_purpose::URL_SAFE_NO_PAD.encode(&decoded);
+            let entry = json!({
+                "recnum": recnum,
+                "pcr": 0,
+                "digests": [{
+                    "hashAlg": "sha1",
+                    "digest": sha1_digest
+                }],
+                "content_type": "pcclient_std",
+                "content": full_encoded
+            });
+            cel.push(entry);
+        }
+    }
+
+    Value::Array(cel)
+}
+
+fn get_keylime_metadata(
+    pubkey: Option<String>,
+    boottime: Option<String>,
+    hash_alg: &str,
+    sign_alg: &str,
+) -> Value {
+    json!({
+        "boottime": boottime,
+        "pubkey": pubkey,
+        "hash_alg": hash_alg,
+        "sign_alg": sign_alg
+    })
 }
