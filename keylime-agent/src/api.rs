@@ -8,7 +8,7 @@ use log::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub static SUPPORTED_API_VERSIONS: &[&str] = &["2.1", "2.2", "3"];
+pub static SUPPORTED_API_VERSIONS: &[&str] = &["2.1", "2.2", "3.0"];
 
 #[derive(Error, Debug, PartialEq)]
 pub enum APIError {
@@ -122,7 +122,7 @@ pub(crate) fn get_api_scope(version: &str) -> Result<Scope, APIError> {
             .configure(configure_api_v2_1)),
         "2.2" => Ok(web::scope(format!("v{version}").as_ref())
             .configure(configure_api_v2_2)),
-        "3" => Ok(web::scope(format!("v{version}").as_ref())
+        "3.0" => Ok(web::scope(format!("v{version}").as_ref())
             .configure(configure_api_v2_2)),
         _ => Err(APIError::UnsupportedVersion(version.into())),
     }

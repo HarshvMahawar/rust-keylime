@@ -19,6 +19,7 @@ pub mod serialization;
 pub mod structures;
 pub mod tpm;
 pub mod version;
+pub mod cmw;
 
 #[macro_use]
 extern crate static_assertions;
