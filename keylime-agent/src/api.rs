@@ -8,8 +8,8 @@ use log::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub static SUPPORTED_API_VERSIONS: &[&str] = &["2.1", "2.2"];
-
+pub static SUPPORTED_API_VERSIONS: &[&str] = &["2.1", "2.2", "2.4"]; 
+// adding higher version here gives error in keylime (server) cuz server side asks for highest version available, therefore json_response["results"] is not there cuz what is send in CMW
 #[derive(Error, Debug, PartialEq)]
 pub enum APIError {
     #[error("API version \"{0}\" not supported")]
@@ -121,6 +121,8 @@ pub(crate) fn get_api_scope(version: &str) -> Result<Scope, APIError> {
         "2.1" => Ok(web::scope(format!("v{version}").as_ref())
             .configure(configure_api_v2_1)),
         "2.2" => Ok(web::scope(format!("v{version}").as_ref())
+            .configure(configure_api_v2_2)),
+        "2.4" => Ok(web::scope(format!("v{version}").as_ref())
             .configure(configure_api_v2_2)),
         _ => Err(APIError::UnsupportedVersion(version.into())),
     }

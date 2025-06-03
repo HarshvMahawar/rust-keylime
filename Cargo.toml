@@ -15,6 +15,9 @@ repository = "https://github.com/keylime/rust-keylime"
 version = "0.2.7"
 
 [workspace.dependencies]
+byteorder = "1.5.0"
+gimli = "0.27"
+object = "0.32"
 actix-rt = "2"
 actix-web =  { version = "4", default-features = false, features = ["macros", "openssl"] }
 anyhow = { version = "1.0", features = ["backtrace"] }
